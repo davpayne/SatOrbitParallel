@@ -4,6 +4,6 @@
 
 
 int main(){
-  printf("space!\n");
+  printf("space!!\n");
   return 0;
 }
