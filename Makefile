@@ -1,6 +1,7 @@
 EXECS= mainSatOrbit
-CCX = g++
-CCXFLAGS = -g O2
+CCX = g++ # pgcc
+CCXFLAGS = -g O2 #-DUSE_DOUBLE
+#ACCEL_TYPE = PGI-tesla
 
 all: ${EXECS}
 
