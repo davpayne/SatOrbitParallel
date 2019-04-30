@@ -3,12 +3,12 @@
 #include <stdio.h> // printf
 #include <math.h> // fmod
 #include <cmath> // sin cos acos
-//#include <accelmath.h>
+#include <accelmath.h>
 #define PI 3.14159265358979323846
 
 // Define a data structure for the two-line element (TLE), a standard form of satellite position/trajectory
 // TLEs are available from "https://www.celestrak.com/NORAD/elements/". These are pulled from US government sources
-typedef struct{
+typedef struct param_TLE{
   // satellite name
   int sat_num; // A unique number identifying that satellite 
   int epoch; // This is the time step of the given two-line element (TLE)
@@ -25,28 +25,17 @@ typedef struct{
   // if there are weird effects such as alignment of moon and sun with satellite at a certain time to pull it up
 } param_TLE;
 
-
-double inclination_calc(param_TLE current, int time_step_size);
-double raan_calc(param_TLE current, int time_step_size);
-double eccentricity_calc(param_TLE current, int time_step_size);
-double perigee_calc(param_TLE current, int time_step_size);
-double anomaly_calc(param_TLE current, int time_step_size);
-double motion_calc(param_TLE current, int time_step_size);
-double drag_calc(param_TLE current, int time_step_size);
-
 bool collision_risk(param_TLE sat1, param_TLE sat2);
 
-double true_anomaly_radians(double mean_anomaly_degrees, double eccentricity);
+//double altitude_calc(double mean_motion);
 
-double eccentric_anomaly_rads(double true_anomaly_rads, double eccentricity);
-
-double altitude_calc(double mean_motion);
-
-void load_sat_data(void *sat_array_in, int number_of_sats, int number_of_t_steps);
+int load_sat_data(param_TLE **sat_array, int number_of_sats, int number_of_t_steps);
+// void *sat_array_in
 
 int main(){
 
- int number_of_time_steps = 8000; // How far in the future do you want to propogate 
+  for(int number_of_time_steps = 10; number_of_time_steps < 100000; number_of_time_steps*=2){
+    // int number_of_time_steps = 8000; // How far in the future do you want to propogate 
 
  int number_of_satellites = 10; // How many satellites are you analyzing
 
@@ -57,17 +46,35 @@ int main(){
   time_step_size = 1; 
   
   // Initialize an array with a row for each satellite and a column for each time step
-  param_TLE sats_over_time[number_of_satellites][number_of_time_steps];
+  param_TLE** sats_over_time;
+
+  sats_over_time = new param_TLE*[number_of_satellites];
+
+  for(int i=0; i<number_of_satellites; i++){
+    sats_over_time[i] = new param_TLE[number_of_time_steps];
+  }
+  //param_TLE sats_over_time[number_of_satellites][number_of_time_steps];
   //  bool collision_risk_over_time[number_of_time_steps][number_of_satellites][number_of_satellites];
 
   // Use function to load satellite data into TLE array made above
   load_sat_data(sats_over_time, number_of_satellites, number_of_time_steps);
 
   // Display size of array. # of rows = number of satellites and # of columns = number of time steps 
-  printf("Number of Satellites:%d | Number of Time Steps:%d\n", sizeof(sats_over_time)/sizeof(sats_over_time[0]), sizeof(sats_over_time[0])/sizeof(sats_over_time[0][0]));
+  //  printf("Number of Satellites:%d | Number of Time Steps:%d\n", sizeof(sats_over_time)/sizeof(sats_over_time[0]), sizeof(sats_over_time[0])/sizeof(sats_over_time[0][0]));
+  printf("Number of Satellites:%d | Number of Time Steps: %d\n", number_of_satellites, number_of_time_steps);
 
-  //#pragma acc data copy(sats_over_time[0:2][0:100]) copyin(sats_over_time[0:2][0:100]) copyout(sats_over_time[0:2][0:100])
+  //  printf("Sanity check: %d\n", sats_over_time[0][0].sat_num);
+
+  
   // Go through each time step. -1 as the first time step is filled with the initial conditions
+
+  double motion_deg; // Mean motion converted from revolutions per day to degrees per day
+  double true_anomaly_rads; // What is the actual angle for the elliptical orbit. For circular orbits, mean_anomaly=true_anomaly
+  double mean_anomaly_radians; // Needs to be in radians for sin
+  double eccentric_anomaly_radians;
+
+#pragma acc data copy(sats_over_time[0:number_of_satellites][0:number_of_time_steps]) 
+
   for (int time_loops= 0; time_loops < (number_of_time_steps-1); time_loops++){
       // Parallelize for each satellite as those are independent
       #pragma acc parallel loop 
@@ -77,20 +84,38 @@ int main(){
 	param_TLE next_time_sat_TLE = sats_over_time[sat_loops][time_loops+1];
 
 	// Want to parallelize each calculation as each only depends on current
-	    
-	next_time_sat_TLE.inclination = inclination_calc(current_sat_TLE, time_step_size);
+	// Without thrust or any unexpected force, several variables don't change    
+	next_time_sat_TLE.inclination = current_sat_TLE.inclination;
 	
-	next_time_sat_TLE.raan = raan_calc(current_sat_TLE, time_step_size);
+	next_time_sat_TLE.raan = current_sat_TLE.raan;
 
-	next_time_sat_TLE.eccentricity = eccentricity_calc(current_sat_TLE, time_step_size);
+	next_time_sat_TLE.perigee = current_sat_TLE.perigee;
+
+	next_time_sat_TLE.mean_motion = current_sat_TLE.mean_motion - current_sat_TLE.drag*time_step_size;
+
+  // Simplified to circular
+  // new_anomaly=(mean_motion*(time_step_size) + current_anomaly)modulo(360)
+  // modulo(360) as mean_anomaly bounded by 0 and 360 since it's just tracking how far along an ellipse you are
+  // note: time_step_size can be used as given or caclculated by (end_time-start_time)
+	  motion_deg = current_sat_TLE.mean_motion*360; // converts mean_motion from revolutions per day to degrees per day
+	 
+	next_time_sat_TLE.mean_anomaly = fmod(motion_deg*(time_step_size) + current_sat_TLE.mean_anomaly, 360);
+
+  // Simplified for true anomaly. Getting the accurate true anomaly from mean anomaly requires a numerical method, no analytical solution exists. All values in radians
+  // true_anomaly = mean_anomaly + 2*eccentricity*sin(mean_anomaly) + 1.25 * (eccentricity^2) * sin(2*mean_anomaly)
+	mean_anomaly_radians = current_sat_TLE.mean_anomaly*PI/180;
+	true_anomaly_rads = mean_anomaly_radians + 2*current_sat_TLE.eccentricity*sin(mean_anomaly_radians) + 1.25 * (current_sat_TLE.eccentricity*current_sat_TLE.eccentricity)*sin(2*mean_anomaly_radians);
+  
+  // cos-1((eccentricity+cos(true_anomaly_rads))/(1+eccentricity*cos(true_anomaly_rads)))
+
+  eccentric_anomaly_radians = acos((current_sat_TLE.eccentricity+cos(true_anomaly_rads))/(1.0 + current_sat_TLE.eccentricity*cos(true_anomaly_rads)));
+
+
+   // e = (eccentric anomaly - mean anomaly)/sin(eccentric anomaly)
+
+	next_time_sat_TLE.eccentricity = (eccentric_anomaly_radians - mean_anomaly_radians)/sin(eccentric_anomaly_radians);
 	
-	next_time_sat_TLE.perigee = perigee_calc(current_sat_TLE, time_step_size);
-
-	next_time_sat_TLE.mean_motion = motion_calc(current_sat_TLE, time_step_size);
-
-	next_time_sat_TLE.mean_anomaly = anomaly_calc(current_sat_TLE, time_step_size);
-
-	next_time_sat_TLE.drag = drag_calc(current_sat_TLE, time_step_size);
+	  next_time_sat_TLE.drag = current_sat_TLE.drag;
 	
 	next_time_sat_TLE.sat_num = current_sat_TLE.sat_num; // This value doesn't change
 	
@@ -105,6 +130,8 @@ int main(){
 
   bool collision;
   int collision_risk_counter = 0;
+
+#pragma acc data copy(sats_over_time[0:number_of_satellites][0:number_of_time_steps]) copy(collision_risk_counter) 
 // Go through each time step. Start at 1 as the first time step (0) is filled with the initial conditions
   for (int t_loops=1; t_loops<number_of_time_steps; t_loops++){
       // Parallelize for each satellite as those are independent
@@ -112,7 +139,7 @@ int main(){
 
     // -1 as last satellite in list will already be checked against everything else
     for(int sat_loops=0; sat_loops<(number_of_satellites-1); sat_loops++){
-      #pragma acc parallel loop
+#pragma acc parallel loop reduction(+:collision_risk_counter)
       for(int compare_loops = sat_loops+1; compare_loops < number_of_satellites ; compare_loops++){
 	collision = collision_risk(sats_over_time[sat_loops][t_loops], sats_over_time[compare_loops][t_loops]);
 	if(collision){
@@ -126,117 +153,21 @@ int main(){
       }
     } 
   }
-  /*
+  
   for(int i = 1; i < number_of_satellites; i++){
     delete[] sats_over_time[i];
   }
   delete[] sats_over_time;
-  */
+  
   //free(collision_risk_over_time);
 
   printf("Number of collison risks identified: %d\n", collision_risk_counter);  
+
+  }
   return 0;
 }
 
-double anomaly_calc(param_TLE current, int time_step_size){
-  double new_mean_anomaly; // Future mean anomaly that is outputted
-  double motion_deg; // Mean motion converted from revolutions per day to degrees per day
-  double true_anomaly_rads; // What is the actual angle for the elliptical orbit. For circular orbits, mean_anomaly=true_anomaly
-
-  // Simplified to circular
-  // new_anomaly=(mean_motion*(time_step_size) + current_anomaly)modulo(360)
-  // modulo(360) as mean_anomaly bounded by 0 and 360 since it's just tracking how far along an ellipse you are
-  // note: time_step_size can be used as given or caclculated by (end_time-start_time)
-  motion_deg = current.mean_motion*360; // converts mean_motion from revolutions per day to degrees per day
-  new_mean_anomaly = fmod(motion_deg*(time_step_size) + current.mean_anomaly, 360);
-
-  true_anomaly_rads = true_anomaly_radians(current.mean_anomaly, current.eccentricity);
-  //  printf("MA=%f, E=%f, True anomaly=%f\n", current.mean_anomaly, current.eccentricity, true_anomaly_rads);
-  
-    
-  return new_mean_anomaly;
-}
-
-double true_anomaly_radians(double mean_anomaly_degrees, double eccentricity){
-  double true_anomaly_rads; // What is the actual angle for the elliptical orbit. For circular orbits, mean_anomaly=true_anomaly
-  double mean_anomaly_radians; // Needs to be in radians for sin
-
-  // Simplified for true anomaly. Getting the accurate true anomaly from mean anomaly requires a numerical method, no analytical solution exists. All values in radians
-  // true_anomaly = mean_anomaly + 2*eccentricity*sin(mean_anomaly) + 1.25 * (eccentricity^2) * sin(2*mean_anomaly)
-  mean_anomaly_radians = mean_anomaly_degrees*PI/180;
-  true_anomaly_rads = mean_anomaly_radians + 2*eccentricity*sin(mean_anomaly_radians) + 1.25 * (eccentricity*eccentricity)*sin(2*mean_anomaly_radians);
-
-  return true_anomaly_rads;
-} 
-
-double eccentric_anomaly_rads(double true_anomaly_rads, double eccentricity){
-  double eccentric_anomaly_radians;
-  
-  // cos-1((eccentricity+cos(true_anomaly_rads))/(1+eccentricity*cos(true_anomaly_rads)))
-
-  eccentric_anomaly_radians = acos((eccentricity+cos(true_anomaly_rads))/(1.0 + eccentricity*cos(true_anomaly_rads)));
-  
-  return eccentric_anomaly_radians;
-}
-
-double inclination_calc(param_TLE current, int time_step_size){
-  double new_inclination;
-  
-  new_inclination = current.inclination;
-
-  return new_inclination;
-}
-
-double raan_calc(param_TLE current, int time_step_size){
-  double new_raan;
-  
-  new_raan = current.raan;
-
-  return new_raan;
-}
-
-double eccentricity_calc(param_TLE current, int time_step_size){
-  double new_eccentricity;
-  double true_anomaly;
-  double eccentric_anomaly;
-  double mean_anomaly_radians;
-
-  true_anomaly = true_anomaly_radians(current.mean_anomaly, current.eccentricity);
-  eccentric_anomaly = eccentric_anomaly_rads(true_anomaly, current.eccentricity);
-  
-  mean_anomaly_radians = current.mean_anomaly*PI/180;
-
- // e = (eccentric anomaly - mean anomaly)/sin(eccentric anomaly)
-  new_eccentricity = (eccentric_anomaly - mean_anomaly_radians)/sin(eccentric_anomaly);
-
-  return new_eccentricity;
-}
-
-double perigee_calc(param_TLE current, int time_step_size){
-  double new_perigee;
-  
-  new_perigee = current.perigee;
-
-  return new_perigee;
-}
-
-double motion_calc(param_TLE current, int time_step_size){
-  double new_motion;
-  
-  // update the mean motion based upon drag
-  new_motion = current.mean_motion - current.drag*time_step_size;
-
-  return new_motion;
-}
-
-double drag_calc(param_TLE current, int time_step_size){
-  double new_drag;
-  
-  new_drag = current.drag;
-
-  return new_drag;
-}
-
+/*
 double altitude_calc(double mean_motion){
   // accepts mean motion in revolutions per day
   double altitude; // km
@@ -251,21 +182,25 @@ double altitude_calc(double mean_motion){
   altitude = cbrt(G*M*pow(orbital_period_s,2))/1000;
   printf("Altitude: %f\n", altitude);
   return altitude;
-}
+  }*/
 
 bool collision_risk(param_TLE sat1, param_TLE sat2){
   bool motion_check;
   bool anomaly_check;
   double degrees_to_rads = PI/180;
-  
+  double sat1_pos;
+  double sat2_pos;
+
   if (sat1.mean_motion/sat2.mean_motion > 0.98 & sat1.mean_motion/sat2.mean_motion < 1.02){
     motion_check = true;
   } else {
     motion_check = false;
   }
 
+  sat1_pos = sat1.mean_anomaly*degrees_to_rads+sat1.perigee*degrees_to_rads;
+  sat2_pos = sat2.mean_anomaly*degrees_to_rads+sat2.perigee*degrees_to_rads;
 
-  if ((true_anomaly_radians(sat1.mean_anomaly,sat1.eccentricity)+sat1.perigee*degrees_to_rads)/(true_anomaly_radians(sat2.mean_anomaly,sat2.eccentricity)+sat2.perigee*degrees_to_rads) > 0.98 & (true_anomaly_radians(sat1.mean_anomaly,sat1.eccentricity)+sat1.perigee*degrees_to_rads)/(true_anomaly_radians(sat2.mean_anomaly,sat2.eccentricity)+sat2.perigee*degrees_to_rads) < 1.02){
+  if (sat1_pos/sat2_pos > 0.98 & sat1_pos/sat2_pos < 1.02) {
     anomaly_check = true;
   } else {
     anomaly_check = false;
@@ -279,9 +214,9 @@ bool collision_risk(param_TLE sat1, param_TLE sat2){
 }
 
 //void load_sat_data(param_TLE sat_array[number_of_satellites][number_of_time_steps]){
-void load_sat_data(void *sat_array_in, int number_of_sats, int number_of_t_steps){
-
-  param_TLE (*sat_array)[number_of_t_steps] = (param_TLE (*)[number_of_t_steps]) sat_array_in;
+int load_sat_data(param_TLE **sat_array, int number_of_sats, int number_of_t_steps){
+  // void *sat_array_in
+  //param_TLE (*sat_array)[number_of_t_steps] = (param_TLE (*)[number_of_t_steps]) sat_array_in;
 
   /* Cosmos 1191. Pulled from https://github.com/Bill-Gray/sat_code/blob/master/test.tle */
   //1 11871U 80057A   01309.36911127 -.00000499 +00000-0 +10000-3 0 08380
@@ -423,6 +358,7 @@ void load_sat_data(void *sat_array_in, int number_of_sats, int number_of_t_steps
   picsat_TLE.drag = 0.00052057;
   sat_array[9][0] = picsat_TLE;
 
+  return 0;
 }
 
 
